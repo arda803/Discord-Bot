@@ -46,6 +46,7 @@ KEDU automatically updates its Discord status with live information such as:
 
 The bot status automatically rotates between server statistics and music information.
 ### Bot Commands
+---
 🎵 Müzik Botu Yardım Menüsü
 Aşağıda botun tüm slash komutlarını ve açıklamalarını bulabilirsiniz.
 ▶️ Oynatma Kontrolleri
