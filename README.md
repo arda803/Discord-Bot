@@ -50,23 +50,37 @@ The bot status automatically rotates between server statistics and music informa
 🎵 Müzik Botu Yardım Menüsü
 Aşağıda botun tüm slash komutlarını ve açıklamalarını bulabilirsiniz.
 ▶️ Oynatma Kontrolleri
-/play <sorgu> - Şarkı veya Spotify linki oynat / sıraya ekle\
-/playlist <url> - YouTube playlist'ini sıraya ekle\
-/skip - Şu an çalan şarkıyı atla\
-/pause - Şarkıyı duraklat\
-/resume - Duraklatılmış şarkıyı devam ettir\
-/stop - Sırayı temizle ve kanaldan ayrıl\
-/loop <mod> - Döngü modu: tek, sıra, kapat\
-/shuffle - Kuyruktaki şarkıları karıştır\
-/remove <sıra> - Kuyruktan şarkı kaldır\
-/seek <saniye> - Şarkıda ileri/geri sar\
+/play <sorgu> - Şarkı veya Spotify linki oynat / sıraya ekle
+/playlist <url> - YouTube playlist'ini sıraya ekle
+/skip - Şu an çalan şarkıyı atla
+/pause - Şarkıyı duraklat
+/resume - Duraklatılmış şarkıyı devam ettir
+/stop - Sırayı temizle ve kanaldan ayrıl
+/loop <mod> - Döngü modu: tek, sıra, kapat
+/shuffle - Kuyruktaki şarkıları karıştır
+/remove <sıra> - Kuyruktan şarkı kaldır
+/seek <saniye> - Şarkıda ileri/geri sar
 /karaoke - Senkronize karaoke sözlerini aç/kapat
 🔊 Ses & Sıra Yönetimi
-/join - Bulunduğunuz ses kanalına katıl\n/leave - Ses kanalından ayrıl\n/volume <0-200> - Ses seviyesini ayarla\n/queue [sayfa] - Şarkı sırasını göster\n/nowplaying - Şu an çalan şarkıyı göster
+/join - Bulunduğunuz ses kanalına katıl
+/leave - Ses kanalından ayrıl
+/volume <0-200> - Ses seviyesini ayarla
+/queue [sayfa] - Şarkı sırasını göster
+/nowplaying - Şu an çalan şarkıyı göster
 ❤️ Favoriler
-/favori - Şu an çalan şarkıyı favorilere ekle\n/favoriler - Favori şarkılarını listele\n/favoriçal - Favori şarkılarını sıraya ekleyip oynat\n/favorisil <sıra> - Favorilerden şarkı sil
+/favori - Şu an çalan şarkıyı favorilere ekle
+/favoriler - Favori şarkılarını listele
+/favoriçal - Favori şarkılarını sıraya ekleyip oynat
+/favorisil <sıra> - Favorilerden şarkı sil
 📀 Kullanıcı Playlistleri
-/playlist_oluştur <isim> - Yeni bir playlist oluştur\n/playlist_ekle <playlist_id> - Çalan şarkıyı playlist'e ekle\n/playlist_queue_kaydet <playlist_id> - Kuyruktaki şarkıları playlist'e kaydet\n/playlist_göster <playlist_id> [sayfa] - Playlist içeriğini göster\n/playlist_shuffle <playlist_id> - Playlist'i karıştırarak yükle\n/playlist_çal <playlist_id> - Playlist'i sıraya ekleyip oynat\n/playlist_sil <playlist_id> - Playlist'i sil\n/playlist_remove_song <playlist_id> <sıra> - Playlist'ten şarkı sil
+/playlist_oluştur <isim> - Yeni bir playlist oluştur
+/playlist_ekle <playlist_id> - Çalan şarkıyı playlist'e ekle
+/playlist_queue_kaydet <playlist_id> - Kuyruktaki şarkıları playlist'e kaydet
+/playlist_göster <playlist_id> [sayfa] - Playlist içeriğini göster
+/playlist_shuffle <playlist_id> - Playlist'i karıştırarak yükle
+/playlist_çal <playlist_id> - Playlist'i sıraya ekleyip oynat
+/playlist_sil <playlist_id> - Playlist'i sil
+/playlist_remove_song <playlist_id> <sıra> - Playlist'ten şarkı sil
 Not: Tüm komutlar / ile başlar. Şarkı sırasında butonları da kullanabilirsiniz.
 ---
 
