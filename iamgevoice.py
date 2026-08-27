@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from discord import state
+
 # bot.py - Geliştirilmiş, kararlı sürüm
 
 """
@@ -17,9 +19,13 @@ Discord Music Bot — Production-Ready with Slash Commands, UI, Spotify, and Pla
 - Playlist'ten şarkı silme
 - Bot presence (çalan şarkı gösterimi)
 - Daha iyi ses kalitesi
+- 🎤 Senkronize Karaoke Modu (LRCLIB, mevcut oynatma zaman çizgisiyle senkron)
 """
 
 import asyncio
+import bisect
+import difflib
+import json
 import logging
 import random
 import os
@@ -27,9 +33,10 @@ import re
 import time
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any, Deque, List
+from typing import Optional, Dict, Any, Deque, List, Tuple
 from dataclasses import dataclass, field
 from collections import deque
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -99,6 +106,9 @@ SPOTIFY_PLAYLIST_TRACK_LIMIT = 200
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
 
+# Karaoke negative cache TTL (seconds) – 7 days
+NEGATIVE_CACHE_TTL = 7 * 24 * 3600
+
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
 
@@ -130,13 +140,27 @@ class GuildMusicState:
         self.loop_queue: bool = False        # Tüm sıra döngüsü
         self.current_song: Optional[Song] = None
         self.volume: float = 0.5
-        self.is_seeking: bool = False
-        self.seek_position: Optional[int] = None
+        # Robust seek state (replaces is_seeking/seek_position)
+        self.seek_target: Optional[int] = None
+        self.seek_retry_count: int = 0
+        self.seek_confirm_task: Optional[asyncio.Task] = None
+        self.playback_generation: int = 0
         self.now_playing_message: Optional[discord.Message] = None
         self.active: bool = False
         self.played_any: bool = False
         self.failed_count: int = 0
         self.started_at: float = 0.0
+        self.playback_offset: float = 0.0
+        self.paused_at: float = 0.0
+        self.timer_task: Optional[asyncio.Task] = None
+        # ── Karaoke state (per-guild, isolated) ──
+        self.karaoke_enabled: bool = False
+        self.lyrics_track: Optional["LyricsTrack"] = None
+        self.lyrics_song: Optional[Song] = None       # which Song object lyrics_track belongs to
+        self.karaoke_active_index: int = -1
+        self.karaoke_message: Optional[discord.Message] = None
+        self.karaoke_task: Optional[asyncio.Task] = None
+        self.karaoke_fetch_task: Optional[asyncio.Task] = None
 
 
 # ─── Exceptions ──────────────────────────────────────────────────────────────
@@ -196,6 +220,17 @@ class DatabaseManager:
                     song_uploader TEXT,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (user_id, song_url)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS lyrics_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    title TEXT,
+                    artist TEXT,
+                    duration INTEGER,
+                    lines_json TEXT,
+                    found INTEGER NOT NULL,
+                    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             await db.commit()
@@ -327,6 +362,378 @@ class DatabaseManager:
                         requester=None
                     ))
                 return songs
+
+    # ── Lyrics cache (karaoke) ──────────────────────────────────────────
+
+    async def get_cached_lyrics(self, cache_key: str, ttl_negative: int = NEGATIVE_CACHE_TTL) -> Optional[Any]:
+        """Returns a LyricsTrack on a positive cache hit, the string 'NONE' on
+        a cached negative result that is still fresh, or None if there is no
+        cache entry or the negative entry has expired (TTL exceeded)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT title, artist, duration, lines_json, found, cached_at FROM lyrics_cache WHERE cache_key = ?",
+                (cache_key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        title, artist, duration, lines_json, found, cached_at = row
+        if not found:
+            # Negative cache: check TTL
+            if ttl_negative > 0 and cached_at:
+                try:
+                    dt = datetime.strptime(cached_at, "%Y-%m-%d %H:%M:%S")
+                    # SQLite stores CURRENT_TIMESTAMP in UTC (if default set)
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    age = (now - dt).total_seconds()
+                    if age > ttl_negative:
+                        logger.info(f"[KARAOKE] Negative cache expired (age {age:.0f}s > {ttl_negative}s), treating as miss")
+                        return None
+                except Exception:
+                    # If timestamp parsing fails, treat as expired to be safe
+                    return None
+            return "NONE"
+        try:
+            raw_lines = json.loads(lines_json) if lines_json else []
+            lines = [LyricLine(timestamp=l["t"], text=l["x"], index=i) for i, l in enumerate(raw_lines)]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not lines:
+            return None
+        return LyricsTrack(title=title or "", artist=artist or "", duration=duration, lines=lines)
+
+    async def cache_lyrics(self, cache_key: str, track: "LyricsTrack") -> None:
+        lines_json = json.dumps([{"t": l.timestamp, "x": l.text} for l in track.lines])
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO lyrics_cache
+                   (cache_key, title, artist, duration, lines_json, found, cached_at)
+                   VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)""",
+                (cache_key, track.title, track.artist, track.duration, lines_json)
+            )
+            await db.commit()
+
+    async def cache_lyrics_negative(self, cache_key: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO lyrics_cache
+                   (cache_key, title, artist, duration, lines_json, found, cached_at)
+                   VALUES (?, '', '', NULL, NULL, 0, CURRENT_TIMESTAMP)""",
+                (cache_key,)
+            )
+            await db.commit()
+
+
+# ─── Karaoke: Lyrics Data Model ──────────────────────────────────────────
+
+@dataclass
+class LyricLine:
+    timestamp: float
+    text: str
+    index: int
+
+
+@dataclass
+class LyricsTrack:
+    title: str
+    artist: str
+    duration: Optional[int]
+    lines: List[LyricLine]
+
+    def active_index(self, position: float) -> int:
+        """Returns the index of the lyric line active at `position` seconds,
+        or -1 if playback hasn't reached the first line yet."""
+        if not self.lines:
+            return -1
+        timestamps = [l.timestamp for l in self.lines]
+        return bisect.bisect_right(timestamps, position) - 1
+
+
+# ─── Karaoke: Lyrics Provider (LRCLIB) ───────────────────────────────────
+
+def _normalize_text(s: str) -> str:
+    """Lowercases and strips bracketed noise (e.g. '(Official Video)',
+    '[Lyrics]') and punctuation, for fuzzy title/artist comparison."""
+    s = (s or "").lower()
+    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    s = re.sub(r"[^a-z0-9ğüşıöçâîû ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize_text(a), _normalize_text(b)).ratio()
+
+
+LRC_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$")
+
+
+def _parse_lrc(text: str) -> List[LyricLine]:
+    lines: List[LyricLine] = []
+    for raw in (text or "").splitlines():
+        m = LRC_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        minutes = int(m.group(1))
+        seconds = float(m.group(2))
+        content = m.group(3).strip()
+        lines.append(LyricLine(timestamp=minutes * 60 + seconds, text=content, index=0))
+    lines.sort(key=lambda l: l.timestamp)
+    for i, l in enumerate(lines):
+        l.index = i
+    return lines
+
+
+class LyricsProvider:
+    """Abstraction over a synchronized-lyrics source. Karaoke code depends
+    only on this interface (and the normalized LyricsTrack it returns), so
+    the underlying provider can be swapped without touching the engine."""
+
+    async def fetch(self, title: str, artist: Optional[str], duration: Optional[int]) -> Optional[LyricsTrack]:
+        raise NotImplementedError
+
+
+class LRCLibProvider(LyricsProvider):
+    """Fetches synchronized lyrics from LRCLIB (https://lrclib.net)."""
+
+    BASE_URL = "https://lrclib.net/api"
+    MIN_TITLE_CONFIDENCE = 0.55
+    MAX_DURATION_DRIFT = 5  # seconds
+
+    def _validate(self, data: Dict[str, Any], title: str, artist: Optional[str], duration: Optional[int]) -> Optional[LyricsTrack]:
+        synced = data.get("syncedLyrics")
+        if not synced:
+            return None
+        result_duration = data.get("duration")
+        if duration and result_duration and abs(duration - result_duration) > self.MAX_DURATION_DRIFT:
+            return None
+        title_score = _similarity(title, data.get("trackName", ""))
+        if title_score < self.MIN_TITLE_CONFIDENCE:
+            return None
+        lines = _parse_lrc(synced)
+        if not lines:
+            return None
+        return LyricsTrack(
+            title=data.get("trackName") or title,
+            artist=data.get("artistName") or (artist or ""),
+            duration=result_duration,
+            lines=lines,
+        )
+
+    def _pick_best(self, results: List[Dict[str, Any]], title: str, artist: Optional[str], duration: Optional[int]) -> Optional[Dict[str, Any]]:
+        best, best_score = None, 0.0
+        for r in results:
+            if not r.get("syncedLyrics"):
+                continue
+            r_duration = r.get("duration")
+            if duration and r_duration and abs(duration - r_duration) > self.MAX_DURATION_DRIFT:
+                continue
+            score = _similarity(title, r.get("trackName", ""))
+            if artist:
+                score = (score + _similarity(artist, r.get("artistName", ""))) / 2
+            if score > best_score:
+                best_score, best = score, r
+        if best_score < self.MIN_TITLE_CONFIDENCE:
+            return None
+        return best
+
+    async def fetch(self, title: str, artist: Optional[str], duration: Optional[int]) -> Optional[LyricsTrack]:
+        timeout = aiohttp.ClientTimeout(total=8)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Try the exact-match endpoint first (fast path when metadata lines up).
+                params: Dict[str, str] = {"track_name": title}
+                if artist:
+                    params["artist_name"] = artist
+                if duration:
+                    params["duration"] = str(int(duration))
+                try:
+                    async with session.get(f"{self.BASE_URL}/get", params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            track = self._validate(data, title, artist, duration)
+                            if track:
+                                return track
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass  # fall through to search
+
+                # Fall back to search + fuzzy-matched candidate selection.
+                search_params = {"track_name": title, "artist_name": artist or ""}
+                async with session.get(f"{self.BASE_URL}/search", params=search_params) as resp:
+                    if resp.status != 200:
+                        return None
+                    results = await resp.json()
+                    if not isinstance(results, list):
+                        return None
+                    best = self._pick_best(results, title, artist, duration)
+                    if not best:
+                        return None
+                    return self._validate(best, title, artist, duration)
+        except asyncio.TimeoutError:
+            logger.warning("[KARAOKE] LRCLIB request timed out")
+        except aiohttp.ClientError as e:
+            logger.warning(f"[KARAOKE] LRCLIB request failed: {e}")
+        except Exception as e:
+            logger.warning(f"[KARAOKE] LRCLIB unexpected error: {e}")
+        return None
+
+
+# ─── Karaoke: Lyrics Service (provider + cache) ──────────────────────────
+
+class LyricsService:
+    """Sits between the karaoke engine and the provider: checks the cache
+    first, calls the provider on a miss, and caches both positive and
+    negative results (negative with TTL)."""
+
+    def __init__(self, db: DatabaseManager, provider: LyricsProvider):
+        self.db = db
+        self.provider = provider
+
+    @staticmethod
+    def cache_key(title: str, artist: Optional[str], duration: Optional[int]) -> str:
+        norm_title = _normalize_text(title)
+        norm_artist = _normalize_text(artist or "")
+        # Bucket duration to the nearest 3s so trivial metadata jitter between
+        # re-resolves of the same song still hits the same cache entry.
+        bucket = int(duration // 3) if duration else 0
+        return f"{norm_title}|{norm_artist}|{bucket}"
+
+    def _clean_title_part(self, title_part: str) -> str:
+        """Remove common video suffixes from the title part after split."""
+        # Patterns that appear at the end, with optional dash/space
+        suffixes = [
+            r'\s*[-–—]\s*(Official\s*(Music\s*)?Video|Official\s*Audio|Lyrics\s*Video|HD|4K|Music\s*Video|Official|Video|Audio)',
+            r'\s*\(Official\s*(Music\s*)?Video\)',
+            r'\s*\[(Official\s*(Music\s*)?Video|HD|4K)\]',
+        ]
+        cleaned = title_part
+        for pat in suffixes:
+            cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
+
+    def _parse_metadata(self, song: Song) -> Tuple[str, Optional[str]]:
+        """Extract clean title and artist from the Song object.
+        Priority:
+          1. Parse from title using separators (e.g. "Artist - Title").
+          2. If that fails, fall back to uploader as artist (if available and not generic).
+        Returns (title, artist)."""
+        raw_title = song.title or ""
+        uploader = song.uploader
+
+        # Step 1: Remove parenthetical/bracketed content and common suffixes.
+        # We keep the cleaned version for splitting, but also need to preserve
+        # the original title for fallback.
+        cleaned = raw_title
+        # Remove content in parentheses and brackets
+        cleaned = re.sub(r'\([^)]*\)', '', cleaned)
+        cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
+
+        # Step 2: Try to split by common separators.
+        separators = [" - ", " – ", " — ", " | "]
+        artist = None
+        title = None
+        source = "unknown"
+
+        for sep in separators:
+            if sep in cleaned:
+                parts = cleaned.split(sep, 1)
+                potential_artist = parts[0].strip()
+                potential_title = parts[1].strip()
+                # Both parts should have some substance
+                if potential_artist and len(potential_artist) > 1 and potential_title:
+                    # Clean the title part from common suffixes
+                    potential_title = self._clean_title_part(potential_title)
+                    # Also clean the artist part (remove extra spaces, etc.)
+                    potential_artist = potential_artist.strip()
+                    if potential_artist and potential_title:
+                        artist = potential_artist
+                        title = potential_title
+                        source = "title_parser"
+                        break
+
+        # If we got nothing, try to strip the uploader from the front if it appears as a prefix
+        if not artist and uploader:
+            for sep in separators:
+                if raw_title.startswith(uploader + sep):
+                    potential_title = raw_title[len(uploader) + len(sep):].strip()
+                    # Clean the title
+                    potential_title = self._clean_title_part(potential_title)
+                    if potential_title:
+                        artist = uploader
+                        title = potential_title
+                        source = "uploader_stripped"
+                        break
+
+        # If still no artist, fallback to uploader (if not generic) and use raw title (after cleaning)
+        if not artist:
+            if uploader and uploader.lower() not in ("unknown", "none", ""):
+                artist = uploader
+                source = "uploader_fallback"
+            # Use the cleaned title (without brackets) as title, but we should preserve the original?
+            # We'll use the cleaned title (which removed brackets, but not separators) and then clean suffixes
+            title = self._clean_title_part(cleaned) if not title else title
+
+        # Final fallback: if title is empty, use raw_title
+        if not title:
+            title = raw_title
+
+        # Ensure we don't have an artist that is the same as title (e.g., if uploader is same as title)
+        if artist and title and artist.lower() == title.lower():
+            artist = None
+            source = "same_as_title"
+
+        logger.info(f"[KARAOKE] Metadata parsed: raw_title='{raw_title}', raw_uploader='{uploader}', "
+                    f"parsed_artist='{artist}', parsed_title='{title}', source='{source}'")
+        return title, artist
+
+    async def get_lyrics(self, song: Song) -> Optional[LyricsTrack]:
+        # Parse metadata
+        title, artist = self._parse_metadata(song)
+        duration = song.duration
+
+        logger.info(f"[KARAOKE] Lyrics lookup started for: raw title='{song.title}', raw uploader='{song.uploader}'")
+        logger.info(f"[KARAOKE] Parsed title='{title}', parsed artist='{artist}', duration={duration}s")
+
+        key = self.cache_key(title, artist, duration)
+        logger.info(f"[KARAOKE] Cache key: {key}")
+
+        try:
+            cached = await self.db.get_cached_lyrics(key)
+        except Exception as e:
+            logger.warning(f"[KARAOKE] Cache read failed: {e}")
+            cached = None
+
+        if cached is not None:
+            if cached == "NONE":
+                logger.info(f"[KARAOKE] Negative cache entry found (TTL is handled internally, treating as not found)")
+                return None
+            logger.info(f"[KARAOKE] Cache hit: synchronized lyrics found for '{title}'")
+            return cached
+
+        # Cache miss (or expired negative) – query provider
+        logger.info(f"[KARAOKE] Requesting synchronized lyrics from provider for '{title}'")
+        track: Optional[LyricsTrack] = None
+        try:
+            track = await self.provider.fetch(title, artist, duration)
+        except Exception as e:
+            logger.warning(f"[KARAOKE] Provider error: {e}")
+            # Do not cache negative on errors; let it retry next time.
+            return None
+
+        try:
+            if track:
+                logger.info(f"[KARAOKE] Provider returned synchronized lyrics for '{title}' (artist: {track.artist})")
+                await self.db.cache_lyrics(key, track)
+                return track
+            else:
+                logger.info(f"[KARAOKE] No synchronized lyrics found after provider lookup for '{title}'")
+                # Store negative with TTL (expiry handled by get_cached_lyrics)
+                await self.db.cache_lyrics_negative(key)
+                return None
+        except Exception as e:
+            logger.warning(f"[KARAOKE] Cache write failed: {e}")
+            # If cache write fails, still return track if we have it.
+            return track
 
 
 # ─── Spotify Helper ─────────────────────────────────────────────────────
@@ -543,6 +950,8 @@ class MusicControlView(discord.ui.View):
         if not vc or not vc.is_playing():
             await interaction.response.send_message("Şu anda çalan bir şarkı yok.", ephemeral=True)
             return
+        state = self.cog._get_state(self.ctx.guild.id)
+        state.paused_at = time.monotonic()
         vc.pause()
         await interaction.response.send_message("⏸️ Duraklatıldı.", ephemeral=True)
 
@@ -552,6 +961,11 @@ class MusicControlView(discord.ui.View):
         if not vc or not vc.is_paused():
             await interaction.response.send_message("Duraklatılmış bir şarkı yok.", ephemeral=True)
             return
+        state = self.cog._get_state(self.ctx.guild.id)
+        if state.paused_at and state.started_at:
+            state.playback_offset += state.paused_at - state.started_at
+        state.started_at = time.monotonic()
+        state.paused_at = 0.0
         vc.resume()
         await interaction.response.send_message("▶️ Devam ediyor.", ephemeral=True)
 
@@ -561,6 +975,13 @@ class MusicControlView(discord.ui.View):
         if not vc or not vc.is_playing():
             await interaction.response.send_message("Şu anda çalan bir şarkı yok.", ephemeral=True)
             return
+        state = self.cog._get_state(self.ctx.guild.id)
+        # Invalidate any pending seek to prevent retry loops
+        if state.seek_target is not None:
+            logger.info(f"[SEEK] Skip button pressed during seek, clearing seek state (gen {state.playback_generation})")
+            state.playback_generation += 1
+            state.seek_target = None
+            state.seek_retry_count = 0
         vc.stop()
         await interaction.response.send_message("⏭️ Şarkı atlandı.", ephemeral=True)
 
@@ -579,6 +1000,20 @@ class MusicControlView(discord.ui.View):
     async def seek_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = SeekModal(self.cog, self.ctx)
         await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Karaoke", style=discord.ButtonStyle.secondary, emoji="🎤")
+    async def karaoke_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = get_voice_client(self.ctx)
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            await interaction.response.send_message("Şu anda çalan bir şarkı yok.", ephemeral=True)
+            return
+        state = self.cog._get_state(self.ctx.guild.id)
+        if state.karaoke_enabled:
+            await self.cog._disable_karaoke(state)
+            await interaction.response.send_message("🎤 Karaoke modu kapatıldı.", ephemeral=True)
+        else:
+            await interaction.response.send_message("🎤 Karaoke modu açıldı.", ephemeral=True)
+            await self.cog._enable_karaoke(self.ctx, state, interaction.channel)
 
     @discord.ui.button(label="Favoriye Ekle", style=discord.ButtonStyle.success, emoji="❤️")
     async def favorite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -607,6 +1042,14 @@ class Music(commands.Cog):
         if not has_spotify_creds:
             logger.info("Spotify kimlik bilgileri bulunamadı, Spotify desteği devre dışı.")
         self.ffmpeg_executable = os.getenv("FFMPEG_EXECUTABLE") or "ffmpeg"
+
+        # Karaoke: lyrics provider + cache layer (swappable provider).
+        self.lyrics_service = LyricsService(self.db, LRCLibProvider())
+
+        # Fire-and-forget background tasks (e.g. auto-starting karaoke lookup
+        # on a new song) MUST be kept referenced somewhere, or asyncio's
+        # garbage collector can silently drop them before they ever run.
+        self._background_tasks: "set[asyncio.Task]" = set()
 
         # Discord profilindeki durum kartları arasında dönen sayaç.
         self._presence_index: int = 0
@@ -681,15 +1124,16 @@ class Music(commands.Cog):
                     state = stats["state"]
 
                     if song and state:
-                        volume = round(state.volume * 100)
-                        queue_count = len(state.queue)
-                        text = (
-                            f"🎧 {song.title} • "
-                            f"🔊 %{volume} • "
-                            f"📋 {queue_count} sırada"
-                        )
+                        current_position = self._get_current_position(state)
+                        if song.duration:
+                            text = (
+                                f"🎧 {song.title} • "
+                                f"⏱️ {format_duration(current_position)} / {format_duration(song.duration)}"
+                            )
+                        else:
+                            text = f"🎧 {song.title} • ⏱️ {format_duration(current_position)}"
                     else:
-                        text = "🎵 Müzik bekliyorum • /play ile başlat"
+                        text = "🎵 Müzik botu hazır"
 
                 # Discord activity name alanı sınırlı olduğu için uzun başlıkları kırp.
                 text = text[:120]
@@ -711,6 +1155,17 @@ class Music(commands.Cog):
             # Kart değişim süresi.
             await asyncio.sleep(12)
 
+    def _get_current_position(self, state: GuildMusicState) -> int:
+        """Şarkının mevcut oynatma saniyesini hesaplar."""
+        if not state.started_at:
+            return int(state.playback_offset)
+        # Pause durumunda süre ilerlemesin
+        if state.paused_at:
+            elapsed = state.paused_at - state.started_at
+        else:
+            elapsed = time.monotonic() - state.started_at
+        return max(0, int(state.playback_offset + elapsed))
+
     def _get_state(self, guild_id: int) -> GuildMusicState:
         if guild_id not in self._states:
             self._states[guild_id] = GuildMusicState()
@@ -726,23 +1181,282 @@ class Music(commands.Cog):
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                 pass
 
-        asyncio.create_task(_delete())
+        self._fire_and_forget(_delete())
 
     def _clear_state(self, guild_id: int) -> None:
         state = self._states.get(guild_id)
         if state:
+            self._cancel_timer_task(state)
+            self._cancel_karaoke_task(state)
+            self._cancel_karaoke_fetch(state)
+            # Cancel any pending seek confirmation and invalidate callbacks
+            if state.seek_confirm_task and not state.seek_confirm_task.done():
+                state.seek_confirm_task.cancel()
+                state.seek_confirm_task = None
             state.queue.clear()
             state.current_song = None
+            state.playback_offset = 0.0
+            state.paused_at = 0.0
             state.loop_current = False
             state.loop_queue = False
-            state.is_seeking = False
-            state.seek_position = None
+            state.seek_target = None
+            state.seek_retry_count = 0
+            state.playback_generation += 1
             state.active = False
             state.played_any = False
             state.failed_count = 0
             state.started_at = 0.0
             self._delete_message_later(state.now_playing_message)
             state.now_playing_message = None
+            state.karaoke_enabled = False
+            state.lyrics_track = None
+            state.lyrics_song = None
+            state.karaoke_active_index = -1
+            self._delete_message_later(state.karaoke_message)
+            state.karaoke_message = None
+
+    def _fire_and_forget(self, coro) -> asyncio.Task:
+        """Schedules a background coroutine while keeping a strong reference
+        to the Task, so it can't be garbage-collected before it runs (a
+        well-known asyncio pitfall with bare `asyncio.create_task(...)`)."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _cancel_timer_task(self, state: GuildMusicState) -> None:
+        """Cancel the guild's Now Playing updater task, if any, so it never
+        outlives the song it belongs to (avoids orphaned tasks / cross-guild
+        leakage since each GuildMusicState holds its own task)."""
+        task = state.timer_task
+        state.timer_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _build_now_playing_embed(self, state: GuildMusicState, song: Song) -> discord.Embed:
+        """Builds the 'Now Playing' embed, including the live playback position.
+        Kept as its own helper so both the initial send and the periodic
+        updater produce an identical embed."""
+        embed = discord.Embed(title="▶️ Şimdi Çalıyor", description=f"[{song.title}]({song.url})", color=Colors.PLAYING)
+        if song.thumbnail:
+            embed.set_image(url=song.thumbnail)
+        position = self._get_current_position(state)
+        if song.duration:
+            embed.add_field(
+                name="⏱️ Süre",
+                value=f"{format_duration(position)} / {format_duration(song.duration)}",
+                inline=True,
+            )
+        else:
+            embed.add_field(name="⏱️ Süre", value=format_duration(position), inline=True)
+        if song.uploader:
+            embed.add_field(name="📺 Kanal", value=song.uploader, inline=True)
+        embed.add_field(name="👤 İsteyen", value=song.requester.mention if song.requester else "Bilinmiyor", inline=True)
+        if state.loop_current:
+            embed.set_footer(text="🔂 Tek parça döngüsü aktif")
+        elif state.loop_queue:
+            embed.set_footer(text="🔁 Tüm sıra döngüsü aktif")
+        return embed
+
+    async def _now_playing_updater(self, ctx: PlaybackContext, state: GuildMusicState, song: Song) -> None:
+        """Periodically edits the existing Now Playing message to refresh the
+        live playback position. One of these runs per guild per song; it is
+        cancelled as soon as the song changes, is skipped/stopped, or ends."""
+        try:
+            while True:
+                await asyncio.sleep(1.5)
+
+                # Stop as soon as this is no longer the current song/message,
+                # e.g. skip, stop, seek-restart, or the next track starting.
+                if state.current_song is not song or state.now_playing_message is None:
+                    return
+
+                vc = get_voice_client(ctx)
+                if not vc or not (vc.is_playing() or vc.is_paused()):
+                    return
+
+                embed = self._build_now_playing_embed(state, song)
+                try:
+                    # No `view=` passed → the existing MusicControlView/buttons
+                    # already attached to the message are left untouched.
+                    await state.now_playing_message.edit(embed=embed)
+                except discord.NotFound:
+                    # Message was deleted (e.g. song change cleaned it up).
+                    return
+                except discord.HTTPException as e:
+                    logger.warning(f"Now Playing mesajı güncellenemedi: {e}")
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    # ── Karaoke engine ───────────────────────────────────────────────
+    # The karaoke system is a pure CONSUMER of the existing playback
+    # timeline (_get_current_position / state.started_at / playback_offset).
+    # It never touches vc.play/vc.stop, never owns FFmpeg, and never creates
+    # a second playback process — see NON-NEGOTIABLE COMPATIBILITY REQUIREMENTS.
+
+    def _cancel_karaoke_task(self, state: GuildMusicState) -> None:
+        task = state.karaoke_task
+        state.karaoke_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _cancel_karaoke_fetch(self, state: GuildMusicState) -> None:
+        task = state.karaoke_fetch_task
+        state.karaoke_fetch_task = None
+        if task and not task.done():
+            task.cancel()
+
+    async def _disable_karaoke(self, state: GuildMusicState) -> None:
+        state.karaoke_enabled = False
+        self._cancel_karaoke_task(state)
+        self._cancel_karaoke_fetch(state)
+        if state.karaoke_message:
+            self._delete_message_later(state.karaoke_message)
+            state.karaoke_message = None
+        logger.info("[KARAOKE] Karaoke disabled")
+
+    async def _enable_karaoke(self, ctx: PlaybackContext, state: GuildMusicState, channel) -> None:
+        state.karaoke_enabled = True
+        logger.info("[KARAOKE] Karaoke enabled")
+        try:
+            msg = await channel.send(embed=create_embed("🎤 Karaoke Mode", "Sözler aranıyor...", Colors.PLAYING))
+        except discord.HTTPException as e:
+            logger.warning(f"[KARAOKE] Could not send karaoke message: {e}")
+            return
+        state.karaoke_message = msg
+        if state.current_song:
+            await self._start_karaoke_for_song(ctx, state, state.current_song, state.playback_generation)
+
+    def _build_karaoke_embed(self, state: GuildMusicState, song: Song, position: int) -> discord.Embed:
+        track = state.lyrics_track
+        idx = state.karaoke_active_index
+        rows: List[str] = []
+        if track and track.lines:
+            start = max(0, idx - 1)
+            end = min(len(track.lines), idx + 3)
+            for i in range(start, end):
+                text = track.lines[i].text or "♪"
+                if i == idx:
+                    rows.append(f"🎤 **♪ {text} ♪**")
+                else:
+                    rows.append(text)
+        body = "\n".join(rows) if rows else "…"
+        artist_part = f" — {song.uploader}" if song.uploader else ""
+        description = (
+            f"🎵 **{song.title}**{artist_part}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n{body}\n\n━━━━━━━━━━━━━━━━━━━━"
+        )
+        embed = discord.Embed(title="🎤 Karaoke Mode", description=description, color=Colors.PLAYING)
+        dur_text = format_duration(position)
+        if song.duration:
+            dur_text += f" / {format_duration(song.duration)}"
+        embed.add_field(name="⏱️", value=dur_text, inline=False)
+        return embed
+
+    async def _update_karaoke_message(self, state: GuildMusicState, song: Song, position: Optional[int] = None, no_lyrics: bool = False) -> None:
+        if state.karaoke_message is None:
+            return
+        try:
+            if no_lyrics or state.lyrics_track is None:
+                embed = create_embed(
+                    "🎤 Karaoke",
+                    f"❌ **{song.title}** için senkronize karaoke sözleri bulunamadı.",
+                    Colors.WARNING,
+                )
+            else:
+                if position is None:
+                    position = self._get_current_position(state)
+                embed = self._build_karaoke_embed(state, song, position)
+            await state.karaoke_message.edit(embed=embed)
+        except discord.NotFound:
+            state.karaoke_message = None
+            self._cancel_karaoke_task(state)
+        except discord.HTTPException as e:
+            logger.warning(f"[KARAOKE] Mesaj güncellenemedi: {e}")
+
+    async def _karaoke_updater(self, ctx: PlaybackContext, state: GuildMusicState, song: Song, generation: int) -> None:
+        """One of these runs per guild per song while karaoke is active. Reuses
+        the SAME authoritative playback position as the Now Playing timer —
+        it never runs its own clock. Cancelled on song change, skip, stop,
+        karaoke-disable, or a new seek restart (see _play_song)."""
+        try:
+            while True:
+                if state.playback_generation != generation:
+                    return
+                if state.current_song is not song or not state.karaoke_enabled:
+                    return
+                if state.karaoke_message is None or state.lyrics_track is None:
+                    return
+                vc = get_voice_client(ctx)
+                if not vc or not (vc.is_playing() or vc.is_paused()):
+                    return
+
+                position = self._get_current_position(state)
+                new_index = state.lyrics_track.active_index(position)
+                if new_index != state.karaoke_active_index:
+                    state.karaoke_active_index = new_index
+                    logger.info(f"[KARAOKE] Active lyric changed to index {new_index}")
+                    await self._update_karaoke_message(state, song, position)
+
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            logger.info("[KARAOKE] Lyrics task cancelled")
+            raise
+        except Exception as e:
+            logger.warning(f"[KARAOKE] Updater error: {e}")
+
+    async def _fetch_and_start_karaoke(self, ctx: PlaybackContext, state: GuildMusicState, song: Song, generation: int) -> None:
+        try:
+            track = await self.lyrics_service.get_lyrics(song)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[KARAOKE] API error: {e}")
+            track = None
+
+        # Stale guards: song may have changed/skipped/stopped while the API call was in flight.
+        if state.playback_generation != generation or state.current_song is not song or not state.karaoke_enabled:
+            return
+
+        state.lyrics_song = song
+        state.karaoke_active_index = -1
+
+        if track is None:
+            state.lyrics_track = None
+            await self._update_karaoke_message(state, song, no_lyrics=True)
+            return
+
+        state.lyrics_track = track
+        if state.karaoke_message is not None:
+            self._cancel_karaoke_task(state)
+            state.karaoke_task = asyncio.create_task(self._karaoke_updater(ctx, state, song, generation))
+
+    async def _start_karaoke_for_song(self, ctx: PlaybackContext, state: GuildMusicState, song: Song, generation: int) -> None:
+        """Ensures the current song has (or is fetching) synchronized lyrics
+        and that the sync task is running. Safe to call on: karaoke enabled
+        mid-song, a new song starting, or a seek restart of the same song."""
+        if not state.karaoke_enabled:
+            return
+
+        if state.lyrics_song is song:
+            if state.lyrics_track is not None:
+                # Already resolved for this exact song — just (re)start the sync task,
+                # e.g. after a /seek restart. Reset the index so the display refreshes
+                # immediately even if the new position lands on the same line.
+                state.karaoke_active_index = -1
+                self._cancel_karaoke_task(state)
+                state.karaoke_task = asyncio.create_task(self._karaoke_updater(ctx, state, song, generation))
+                if state.karaoke_message:
+                    await self._update_karaoke_message(state, song)
+            else:
+                # Already looked up and confirmed unavailable for this song.
+                if state.karaoke_message:
+                    await self._update_karaoke_message(state, song, no_lyrics=True)
+            return
+
+        self._cancel_karaoke_fetch(state)
+        state.karaoke_fetch_task = asyncio.create_task(self._fetch_and_start_karaoke(ctx, state, song, generation))
 
     async def _maybe_start_playback(self, ctx: PlaybackContext) -> None:
         vc = get_voice_client(ctx)
@@ -762,14 +1476,20 @@ class Music(commands.Cog):
             state.started_at = 0.0
         await self._play_song(ctx, next_song)
 
-    async def _handle_after_playing(self, ctx: PlaybackContext, error: Optional[Exception]) -> None:
+    async def _handle_after_playing(self, ctx: PlaybackContext, error: Optional[Exception], was_seek_attempt: bool = False) -> None:
         state = self._get_state(ctx.guild.id)
-        if error:
+
+        # Intentional stop: state was cleared by _clear_state or slash_stop
+        if state.current_song is None:
+            logger.info("[SEEK] After callback: intentional stop detected (current_song is None)")
+            return
+
+        if error and not was_seek_attempt:
             state.failed_count += 1
             logger.error(f"Playback error: {error}")
             embed = create_embed(
                 "Oynatma Hatası",
-                f"Bu şarkının ses akışı başlatılamadı, sıradakine geçiliyor...\n`{error}`",
+                f"Bu şarkının ses akışı başlatılamadı, sıradakine geçiliyor...\ \n`{error}`",
                 Colors.ERROR,
             )
             try:
@@ -782,11 +1502,58 @@ class Music(commands.Cog):
         queue_finished = False
 
         async with state.lock:
-            if state.is_seeking:
-                state.is_seeking = False
-                seek_pos = state.seek_position
-                state.seek_position = None
-                song_to_play = state.current_song
+            # ── Case A: Seek attempt ──
+            if was_seek_attempt and state.seek_target is not None:
+                logger.info(f"[SEEK] Handling seek aftermath (error={error is not None})")
+
+                if error is None:
+                    # Old playback stopped cleanly to make way for seek restart.
+                    # (If seek had already succeeded, seek_target would be None.)
+                    logger.info("[SEEK] Restarting playback at seek position")
+                    song_to_play = state.current_song
+                    seek_pos = state.seek_target
+                else:
+                    # Seek restart failed — retry once or give up.
+                    state.seek_retry_count += 1
+                    logger.error(f"[SEEK] Seek playback failed, retry {state.seek_retry_count}/1")
+
+                    if state.seek_retry_count <= 1:
+                        logger.info(f"[SEEK] Retry attempt: {state.seek_retry_count}/1")
+                        # Increment generation so the failed attempt's callback is ignored
+                        state.playback_generation += 1
+                        song_to_play = state.current_song
+                        seek_pos = state.seek_target
+                    else:
+                        logger.error("[SEEK] Seek failed after retry, giving up")
+                        # Clean up — do NOT advance queue
+                        state.seek_target = None
+                        state.seek_retry_count = 0
+                        state.playback_generation += 1
+                        state.active = False
+                        state.started_at = 0.0
+                        state.playback_offset = 0.0
+                        state.paused_at = 0.0
+                        self._cancel_timer_task(state)
+                        self._cancel_karaoke_task(state)
+                        self._cancel_karaoke_fetch(state)
+                        if state.seek_confirm_task and not state.seek_confirm_task.done():
+                            state.seek_confirm_task.cancel()
+                            state.seek_confirm_task = None
+                        if state.now_playing_message:
+                            self._delete_message_later(state.now_playing_message)
+                            state.now_playing_message = None
+                        try:
+                            embed = create_embed(
+                                "Sarma Başarısız",
+                                f"⏩ Şarkıda sarma işlemi başarısız oldu. Şarkı durduruldu.\ \n`{error}`",
+                                Colors.ERROR,
+                            )
+                            await ctx.channel.send(embed=embed)
+                        except Exception:
+                            pass
+                        return  # Critical: do not fall through to queue logic
+
+            # ── Case B: Normal playback end / loop / queue ──
             elif state.loop_current and state.current_song:
                 song_to_play = state.current_song
             elif state.loop_queue and state.current_song:
@@ -802,6 +1569,12 @@ class Music(commands.Cog):
             else:
                 state.current_song = None
                 state.active = False
+                state.started_at = 0.0
+                state.playback_offset = 0.0
+                state.paused_at = 0.0
+                self._cancel_timer_task(state)
+                self._cancel_karaoke_task(state)
+                self._cancel_karaoke_fetch(state)
                 queue_finished = True
 
         if song_to_play is not None:
@@ -830,10 +1603,27 @@ class Music(commands.Cog):
 
         state = self._get_state(ctx.guild.id)
 
-        # Önceki 'şimdi çalıyor' mesajını temizle
+        # Capture the generation at the moment we start this playback attempt.
+        # Any operation that increments the generation after this point
+        # (skip, stop, or a seek retry) will cause stale callbacks to be ignored.
+        playback_generation = state.playback_generation
+
+        # Önceki 'şimdi çalıyor' mesajını ve buna bağlı canlı zamanlayıcı görevini temizle
         if state.now_playing_message:
             self._delete_message_later(state.now_playing_message)
             state.now_playing_message = None
+        self._cancel_timer_task(state)
+
+        # Karaoke: always stop the sync task tied to the previous playback attempt.
+        # Only forget the fetched lyrics if this is a genuinely NEW song — a seek
+        # restart (seek is not None) plays the same song again, so its already-
+        # resolved lyrics_track/lyrics_song stay valid and are reused.
+        self._cancel_karaoke_task(state)
+        if seek is None:
+            self._cancel_karaoke_fetch(state)
+            state.lyrics_track = None
+            state.lyrics_song = None
+            state.karaoke_active_index = -1
 
         try:
             # YouTube/Spotify stream URL'leri kısa süreli olabildiği için her şarkı
@@ -841,13 +1631,13 @@ class Music(commands.Cog):
             try:
                 song.source_url = await resolve_song_url(song.url, asyncio.get_running_loop())
             except YTDLError as exc:
-                    logger.warning(f"URL resolve failed for '{song.title}': {exc}")
-                    embed = create_embed(
-                        "Atlandı", f"**{song.title}** oynatılamadı, sıradakine geçiliyor.\n`{exc}`", Colors.WARNING
-                    )
-                    await ctx.channel.send(embed=embed)
-                    await self._handle_after_playing(ctx, None)
-                    return
+                logger.warning(f"URL resolve failed for '{song.title}': {exc}")
+                embed = create_embed(
+                    "Atlandı", f"**{song.title}** oynatılamadı, sıradakine geçiliyor.\ \n`{exc}`", Colors.WARNING
+                )
+                await ctx.channel.send(embed=embed)
+                await self._handle_after_playing(ctx, None, was_seek_attempt=False)
+                return
 
             # FFmpeg ses kaynağını oluştur
             before_options = FFMPEG_BEFORE_OPTIONS
@@ -874,59 +1664,94 @@ class Music(commands.Cog):
                     msg = f"Ses kaynağı oluşturulamadı: {e}"
                 embed = create_embed("Oynatma Hatası", msg, Colors.ERROR)
                 await ctx.channel.send(embed=embed)
-                await self._handle_after_playing(ctx, None)
+                await self._handle_after_playing(ctx, None, was_seek_attempt=False)
                 return
 
             state.current_song = song
 
             def after_callback(error: Optional[Exception]) -> None:
-                elapsed = time.monotonic() - state.started_at if state.started_at else 0.0
-                # FFmpeg bazen bağlantı/stream hatasında exception döndürmeden hemen kapanır.
-                # Böyle bir durumda bunu normal şarkı sonu gibi saymıyoruz.
-                if error is None and elapsed < 2.0:
-                    error = AudioSourceError(
-                        f"Ses akışı çok erken kapandı ({elapsed:.1f} sn). FFmpeg/yt-dlp stream hatası olabilir."
+                # Stale callback guard: if generation changed, this callback is obsolete
+                if state.playback_generation != playback_generation:
+                    logger.info(
+                        f"[SEEK] Stale after_callback ignored "
+                        f"(gen {playback_generation} vs current {state.playback_generation})"
                     )
+                    return
+
+                # Intentional stop detection
+                if state.current_song is None:
+                    logger.info("[SEEK] After callback: intentional stop detected (current_song is None)")
+                    return
+
+                was_seek_attempt = state.seek_target is not None
+
                 if error:
-                    logger.error(f"Playback error in after_callback: {error}")
+                    logger.error(f"[SEEK] After callback received with error: {error}")
                 else:
-                    state.played_any = True
-                    logger.info(f"Playback completed normally after {elapsed:.1f} seconds.")
-                coro = self._handle_after_playing(ctx, error)
+                    elapsed = time.monotonic() - state.started_at if state.started_at else 0.0
+                    # FFmpeg bazen bağlantı/stream hatasında exception döndürmeden hemen kapanır.
+                    # Böyle bir durumda bunu normal şarkı sonu gibi saymıyoruz.
+                    if elapsed < 2.0:
+                        error = AudioSourceError(
+                            f"Ses akışı çok erken kapandı ({elapsed:.1f} sn). FFmpeg/yt-dlp stream hatası olabilir."
+                        )
+                        logger.warning(f"[SEEK] Early termination detected after {elapsed:.1f}s")
+                    else:
+                        state.played_any = True
+                        logger.info(f"[SEEK] Playback completed normally after {elapsed:.1f}s")
+
+                coro = self._handle_after_playing(ctx, error, was_seek_attempt=was_seek_attempt)
                 asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
 
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
                 await asyncio.sleep(0.2)
 
+            # Guard against generation changes that happened during async setup above
+            if state.playback_generation != playback_generation:
+                logger.info(f"[SEEK] Generation changed during setup, aborting playback start (gen {playback_generation})")
+                return
+
             try:
+                if seek is not None and seek > 0:
+                    state.playback_offset = float(seek)
+                else:
+                    state.playback_offset = 0.0
+                state.paused_at = 0.0
                 state.started_at = time.monotonic()
                 vc.play(source, after=after_callback)
+                logger.info(f"[SEEK] FFmpeg playback started for '{song.title}' (gen={playback_generation})")
             except Exception as e:
                 logger.error(f"vc.play failed: {e}")
                 embed = create_embed("Oynatma Hatası", f"Şarkı başlatılamadı: {e}", Colors.ERROR)
                 await ctx.channel.send(embed=embed)
-                await self._handle_after_playing(ctx, None)
+                await self._handle_after_playing(ctx, None, was_seek_attempt=(seek is not None))
                 return
 
-            # Şimdi çalıyor embed'ini gönder
-            embed = discord.Embed(title="▶️ Şimdi Çalıyor", description=f"[{song.title}]({song.url})", color=Colors.PLAYING)
-            if song.thumbnail:
-                embed.set_image(url=song.thumbnail)
-            if song.duration:
-                embed.add_field(name="⏱️ Süre", value=format_duration(song.duration), inline=True)
-            if song.uploader:
-                embed.add_field(name="📺 Kanal", value=song.uploader, inline=True)
-            embed.add_field(name="👤 İsteyen", value=song.requester.mention if song.requester else "Bilinmiyor", inline=True)
-            if state.loop_current:
-                embed.set_footer(text="🔂 Tek parça döngüsü aktif")
-            elif state.loop_queue:
-                embed.set_footer(text="🔁 Tüm sıra döngüsü aktif")
+            # Şimdi çalıyor embed'ini gönder (canlı süre bilgisiyle birlikte)
+            embed = self._build_now_playing_embed(state, song)
 
             view = MusicControlView(self, ctx)
             msg = await ctx.channel.send(embed=embed, view=view)
             state.now_playing_message = msg
             logger.info(f"Playing '{song.title}' in guild {ctx.guild.id}")
+
+            # For seek attempts, delay the live timer until the health check confirms
+            # FFmpeg is actually producing audio. For normal playback, start immediately.
+            is_seek_attempt = seek is not None
+
+            if not is_seek_attempt:
+                # Normal playback: start timer immediately
+                self._cancel_timer_task(state)
+                state.timer_task = asyncio.create_task(self._now_playing_updater(ctx, state, song))
+                if state.karaoke_enabled:
+                    self._fire_and_forget(self._start_karaoke_for_song(ctx, state, song, playback_generation))
+            else:
+                # Seek attempt: start health check confirmation task
+                logger.info(f"[SEEK] Starting health check for seek to {seek}s")
+                state.seek_confirm_task = asyncio.create_task(
+                    self._seek_confirm_task(ctx, state, song, playback_generation)
+                )
 
         except Exception as exc:
             logger.error(f"Unexpected error in _play_song: {exc}")
@@ -935,7 +1760,53 @@ class Music(commands.Cog):
                 await ctx.channel.send(embed=embed)
             except Exception:
                 pass
-            await self._handle_after_playing(ctx, None)
+            await self._handle_after_playing(ctx, None, was_seek_attempt=(seek is not None))
+
+    async def _seek_confirm_task(self, ctx: PlaybackContext, state: GuildMusicState, song: Song, generation: int) -> None:
+        """Wait briefly then confirm FFmpeg is actually producing audio.
+        Only clears seek state on success; failures are handled by after_callback."""
+        try:
+            await asyncio.sleep(1.5)
+
+            # Guard against stale checks
+            if state.playback_generation != generation:
+                logger.info(f"[SEEK] Health check stale (gen {generation} vs {state.playback_generation})")
+                return
+
+            if state.current_song is not song:
+                logger.info("[SEEK] Health check: song changed")
+                return
+
+            vc = get_voice_client(ctx)
+            if vc and (vc.is_playing() or vc.is_paused()):
+                logger.info(f"[SEEK] Playback health check result: SUCCESS (gen={generation})")
+                # Seek is confirmed successful — clear seek state so future callbacks
+                # treat this as normal playback.
+                state.seek_target = None
+                state.seek_retry_count = 0
+
+                # Start the live timer now that playback is confirmed real
+                self._cancel_timer_task(state)
+                state.timer_task = asyncio.create_task(self._now_playing_updater(ctx, state, song))
+                if state.karaoke_enabled:
+                    self._fire_and_forget(self._start_karaoke_for_song(ctx, state, song, generation))
+
+                # Refresh the embed to confirm it's live
+                try:
+                    if state.now_playing_message:
+                        embed = self._build_now_playing_embed(state, song)
+                        await state.now_playing_message.edit(embed=embed)
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"[SEEK] Playback health check result: FAILED (gen={generation})")
+                # Do NOT handle failure here — let after_callback be the single source
+                # of truth for failure handling to avoid double-processing.
+        except asyncio.CancelledError:
+            logger.info("[SEEK] Health check cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"[SEEK] Health check error: {e}")
 
     async def perform_seek(self, ctx: PlaybackContext, seconds: int) -> None:
         vc = get_voice_client(ctx)
@@ -948,9 +1819,21 @@ class Music(commands.Cog):
             raise ValueError("Saniye negatif olamaz.")
         if state.current_song.duration and seconds > state.current_song.duration:
             raise ValueError(f"Süre aşıldı (maks: {format_duration(state.current_song.duration)})")
+
         async with state.lock:
-            state.seek_position = seconds
-            state.is_seeking = True
+            # Cancel any pending confirmation from a previous seek
+            if state.seek_confirm_task and not state.seek_confirm_task.done():
+                state.seek_confirm_task.cancel()
+                state.seek_confirm_task = None
+
+            # Note: we do NOT increment playback_generation here.
+            # The stopping callback must be allowed to run so it can trigger the restart.
+            state.seek_target = seconds
+            state.seek_retry_count = 0
+            logger.info(f"[SEEK] Seek requested: {seconds} seconds in guild {ctx.guild.id}")
+            if state.karaoke_enabled:
+                logger.info(f"[KARAOKE] Seek synchronization: {seconds}s")
+            logger.info("[SEEK] Stopping current playback")
             vc.stop()
 
     async def _resolve_spotify(self, url: str) -> List[Song]:
@@ -1129,6 +2012,13 @@ class Music(commands.Cog):
             embed = create_embed("Hata", "Çalan bir şarkı yok.", Colors.ERROR)
             await interaction.response.send_message(embed=embed)
             return
+        state = self._get_state(interaction.guild.id)
+        # Invalidate any pending seek to prevent retry loops
+        if state.seek_target is not None:
+            logger.info(f"[SEEK] Skip requested during seek, clearing seek state (gen {state.playback_generation})")
+            state.playback_generation += 1
+            state.seek_target = None
+            state.seek_retry_count = 0
         vc.stop()
         embed = create_embed("Atlandı", "⏭️ Şarkı atlandı!", Colors.WARNING)
         await interaction.response.send_message(embed=embed)
@@ -1141,6 +2031,8 @@ class Music(commands.Cog):
             await interaction.response.send_message(embed=embed)
             return
         vc.pause()
+        state = self._get_state(interaction.guild.id)
+        state.paused_at = time.monotonic()
         embed = create_embed("Duraklatıldı", "⏸️ Şarkı duraklatıldı.", Colors.WARNING)
         await interaction.response.send_message(embed=embed)
 
@@ -1151,6 +2043,11 @@ class Music(commands.Cog):
             embed = create_embed("Hata", "Duraklatılmış şarkı yok.", Colors.ERROR)
             await interaction.response.send_message(embed=embed)
             return
+        state = self._get_state(interaction.guild.id)
+        if state.paused_at and state.started_at:
+            state.playback_offset += state.paused_at - state.started_at
+        state.started_at = time.monotonic()
+        state.paused_at = 0.0
         vc.resume()
         embed = create_embed("Devam Ediyor", "▶️ Şarkı devam ediyor.", Colors.SUCCESS)
         await interaction.response.send_message(embed=embed)
@@ -1195,7 +2092,7 @@ class Music(commands.Cog):
         for idx, song in enumerate(items, start=start + 1):
             req = song.requester.mention if song.requester else "Bilinmiyor"
             lines.append(f"`{idx}.` [{song.title}]({song.url}) — {req}")
-        embed = discord.Embed(title="📋 Şarkı Sırası", description="\n".join(lines), color=Colors.INFO)
+        embed = discord.Embed(title="📋 Şarkı Sırası", description="\ \n".join(lines), color=Colors.INFO)
         embed.set_footer(text=f"Sayfa {page}/{total_pages} • Toplam {len(queue_snapshot)} şarkı")
         await interaction.response.send_message(embed=embed)
 
@@ -1258,6 +2155,24 @@ class Music(commands.Cog):
         embed.add_field(name="👤 İsteyen", value=song.requester.mention if song.requester else "Bilinmiyor", inline=True)
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="karaoke", description="Karaoke modunu aç/kapat (senkronize şarkı sözleri).")
+    async def slash_karaoke(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        state = self._get_state(interaction.guild.id)
+        if not state.current_song or not vc or not (vc.is_playing() or vc.is_paused()):
+            embed = create_embed("Hata", "Şu anda çalan bir şarkı yok.", Colors.ERROR)
+            await interaction.response.send_message(embed=embed)
+            return
+
+        if state.karaoke_enabled:
+            await self._disable_karaoke(state)
+            embed = create_embed("Karaoke", "🎤 Karaoke modu kapatıldı.", Colors.WARNING)
+            await interaction.response.send_message(embed=embed)
+        else:
+            embed = create_embed("Karaoke", "🎤 Karaoke modu açıldı.", Colors.SUCCESS)
+            await interaction.response.send_message(embed=embed)
+            await self._enable_karaoke(interaction, state, interaction.channel)
+
     @app_commands.command(name="help", description="Botun tüm komutlarını ve kullanımlarını gösterir.")
     async def slash_help(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -1268,26 +2183,27 @@ class Music(commands.Cog):
         embed.add_field(
             name="▶️ Oynatma Kontrolleri",
             value=(
-                "`/play <sorgu>` - Şarkı veya Spotify linki oynat / sıraya ekle\n"
-                "`/playlist <url>` - YouTube playlist'ini sıraya ekle\n"
-                "`/skip` - Şu an çalan şarkıyı atla\n"
-                "`/pause` - Şarkıyı duraklat\n"
-                "`/resume` - Duraklatılmış şarkıyı devam ettir\n"
-                "`/stop` - Sırayı temizle ve kanaldan ayrıl\n"
-                "`/loop <mod>` - Döngü modu: tek, sıra, kapat\n"
-                "`/shuffle` - Kuyruktaki şarkıları karıştır\n"
-                "`/remove <sıra>` - Kuyruktan şarkı kaldır\n"
-                "`/seek <saniye>` - Şarkıda ileri/geri sar"
+                "`/play <sorgu>` - Şarkı veya Spotify linki oynat / sıraya ekle\ \n"
+                "`/playlist <url>` - YouTube playlist'ini sıraya ekle\ \n"
+                "`/skip` - Şu an çalan şarkıyı atla\ \n"
+                "`/pause` - Şarkıyı duraklat\ \n"
+                "`/resume` - Duraklatılmış şarkıyı devam ettir\ \n"
+                "`/stop` - Sırayı temizle ve kanaldan ayrıl\ \n"
+                "`/loop <mod>` - Döngü modu: tek, sıra, kapat\ \n"
+                "`/shuffle` - Kuyruktaki şarkıları karıştır\ \n"
+                "`/remove <sıra>` - Kuyruktan şarkı kaldır\ \n"
+                "`/seek <saniye>` - Şarkıda ileri/geri sar\ \n"
+                "`/karaoke` - Senkronize karaoke sözlerini aç/kapat"
             ),
             inline=False
         )
         embed.add_field(
             name="🔊 Ses & Sıra Yönetimi",
             value=(
-                "`/join` - Bulunduğunuz ses kanalına katıl\n"
-                "`/leave` - Ses kanalından ayrıl\n"
-                "`/volume <0-200>` - Ses seviyesini ayarla\n"
-                "`/queue [sayfa]` - Şarkı sırasını göster\n"
+                "`/join` - Bulunduğunuz ses kanalına katıl\ \n"
+                "`/leave` - Ses kanalından ayrıl\ \n"
+                "`/volume <0-200>` - Ses seviyesini ayarla\ \n"
+                "`/queue [sayfa]` - Şarkı sırasını göster\ \n"
                 "`/nowplaying` - Şu an çalan şarkıyı göster"
             ),
             inline=False
@@ -1295,9 +2211,9 @@ class Music(commands.Cog):
         embed.add_field(
             name="❤️ Favoriler",
             value=(
-                "`/favori` - Şu an çalan şarkıyı favorilere ekle\n"
-                "`/favoriler` - Favori şarkılarını listele\n"
-                "`/favoriçal` - Favori şarkılarını sıraya ekleyip oynat\n"
+                "`/favori` - Şu an çalan şarkıyı favorilere ekle\ \n"
+                "`/favoriler` - Favori şarkılarını listele\ \n"
+                "`/favoriçal` - Favori şarkılarını sıraya ekleyip oynat\ \n"
                 "`/favorisil <sıra>` - Favorilerden şarkı sil"
             ),
             inline=False
@@ -1305,13 +2221,13 @@ class Music(commands.Cog):
         embed.add_field(
             name="📀 Kullanıcı Playlistleri",
             value=(
-                "`/playlist_oluştur <isim>` - Yeni bir playlist oluştur\n"
-                "`/playlist_ekle <playlist_id>` - Çalan şarkıyı playlist'e ekle\n"
-                "`/playlist_queue_kaydet <playlist_id>` - Kuyruktaki şarkıları playlist'e kaydet\n"
-                "`/playlist_göster <playlist_id> [sayfa]` - Playlist içeriğini göster\n"
-                "`/playlist_shuffle <playlist_id>` - Playlist'i karıştırarak yükle\n"
-                "`/playlist_çal <playlist_id>` - Playlist'i sıraya ekleyip oynat\n"
-                "`/playlist_sil <playlist_id>` - Playlist'i sil\n"
+                "`/playlist_oluştur <isim>` - Yeni bir playlist oluştur\ \n"
+                "`/playlist_ekle <playlist_id>` - Çalan şarkıyı playlist'e ekle\ \n"
+                "`/playlist_queue_kaydet <playlist_id>` - Kuyruktaki şarkıları playlist'e kaydet\ \n"
+                "`/playlist_göster <playlist_id> [sayfa]` - Playlist içeriğini göster\ \n"
+                "`/playlist_shuffle <playlist_id>` - Playlist'i karıştırarak yükle\ \n"
+                "`/playlist_çal <playlist_id>` - Playlist'i sıraya ekleyip oynat\ \n"
+                "`/playlist_sil <playlist_id>` - Playlist'i sil\ \n"
                 "`/playlist_remove_song <playlist_id> <sıra>` - Playlist'ten şarkı sil"
             ),
             inline=False
