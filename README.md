@@ -45,43 +45,51 @@ KEDU automatically updates its Discord status with live information such as:
 - Songs waiting in the queue
 
 The bot status automatically rotates between server statistics and music information.
-### Bot Commands
----
-🎵 Müzik Botu Yardım Menüsü
-Aşağıda botun tüm slash komutlarını ve açıklamalarını bulabilirsiniz.
-▶️ Oynatma Kontrolleri
-/play <sorgu> - Şarkı veya Spotify linki oynat / sıraya ekle
-/playlist <url> - YouTube playlist'ini sıraya ekle
-/skip - Şu an çalan şarkıyı atla
-/pause - Şarkıyı duraklat
-/resume - Duraklatılmış şarkıyı devam ettir
-/stop - Sırayı temizle ve kanaldan ayrıl
-/loop <mod> - Döngü modu: tek, sıra, kapat
-/shuffle - Kuyruktaki şarkıları karıştır
-/remove <sıra> - Kuyruktan şarkı kaldır
-/seek <saniye> - Şarkıda ileri/geri sar
-/karaoke - Senkronize karaoke sözlerini aç/kapat
-🔊 Ses & Sıra Yönetimi
-/join - Bulunduğunuz ses kanalına katıl
-/leave - Ses kanalından ayrıl
-/volume <0-200> - Ses seviyesini ayarla
-/queue [sayfa] - Şarkı sırasını göster
-/nowplaying - Şu an çalan şarkıyı göster
-❤️ Favoriler
-/favori - Şu an çalan şarkıyı favorilere ekle
-/favoriler - Favori şarkılarını listele
-/favoriçal - Favori şarkılarını sıraya ekleyip oynat
-/favorisil <sıra> - Favorilerden şarkı sil
-📀 Kullanıcı Playlistleri
-/playlist_oluştur <isim> - Yeni bir playlist oluştur
-/playlist_ekle <playlist_id> - Çalan şarkıyı playlist'e ekle
-/playlist_queue_kaydet <playlist_id> - Kuyruktaki şarkıları playlist'e kaydet
-/playlist_göster <playlist_id> [sayfa] - Playlist içeriğini göster
-/playlist_shuffle <playlist_id> - Playlist'i karıştırarak yükle
-/playlist_çal <playlist_id> - Playlist'i sıraya ekleyip oynat
-/playlist_sil <playlist_id> - Playlist'i sil
-/playlist_remove_song <playlist_id> <sıra> - Playlist'ten şarkı sil
-Not: Tüm komutlar / ile başlar. Şarkı sırasında butonları da kullanabilirsiniz.
+## 🤖 Bot Commands
+
+All commands are used with `/`.
+
+### 🎵 Playback Controls
+
+- `/play <query>` — Play a song or Spotify link, or add it to the queue
+- `/playlist <url>` — Add a YouTube playlist to the queue
+- `/skip` — Skip the currently playing song
+- `/pause` — Pause the current song
+- `/resume` — Resume playback
+- `/stop` — Clear the queue and leave the voice channel
+- `/loop <mode>` — Loop mode: single, queue, or off
+- `/shuffle` — Shuffle the songs in the queue
+- `/remove <position>` — Remove a song from the queue
+- `/seek <seconds>` — Seek forward or backward in the song
+- `/karaoke` — Enable or disable synchronized karaoke lyrics
+
+### 🔊 Voice & Queue Management
+
+- `/join` — Join your current voice channel
+- `/leave` — Leave the voice channel
+- `/volume <0-200>` — Adjust the volume
+- `/queue [page]` — Display the current music queue
+- `/nowplaying` — Show the currently playing song
+
+### ❤️ Favorites
+
+- `/favori` — Add the currently playing song to your favorites
+- `/favoriler` — Display your favorite songs
+- `/favoriçal` — Add your favorite songs to the queue and start playing
+- `/favorisil <position>` — Remove a song from your favorites
+
+### 📀 User Playlists
+
+- `/playlist_oluştur <name>` — Create a new playlist
+- `/playlist_ekle <playlist_id>` — Add the currently playing song to a playlist
+- `/playlist_queue_kaydet <playlist_id>` — Save the current queue to a playlist
+- `/playlist_göster <playlist_id> [page]` — Display playlist contents
+- `/playlist_shuffle <playlist_id>` — Load a playlist in shuffled order
+- `/playlist_çal <playlist_id>` — Add a playlist to the queue and start playing
+- `/playlist_sil <playlist_id>` — Delete a playlist
+- `/playlist_remove_song <playlist_id> <position>` — Remove a song from a playlist
+
+> **Note:** All commands start with `/`. You can also use the interactive buttons while music is playing.
 ---
 
 ## 🚀 Installation
