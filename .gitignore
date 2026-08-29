@@ -1,0 +1,39 @@
+# Token ve ortam değişkenleri
+.env
+*.env
+*.env.*
+token.txt
+
+# Veritabanı
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+env/
+.venv/
+.pytest_cache/
+.coverage
+.tox/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Yerel medya / geçici dosyalar
+media/
+downloads/
+temp/
+logs/
+*.log
+ffmpeg.exe
+ffprobe.exe
