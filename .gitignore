@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Token ve ortam değişkenleri
 .env
 *.env
@@ -21,10 +22,24 @@ env/
 .coverage
 .tox/
 .mypy_cache/
+=======
+# Secrets
+.env
+.env.*
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+>>>>>>> ec914116a50255c5a4639af876094c8e846ce15b
 
 # IDE
 .vscode/
 .idea/
+<<<<<<< HEAD
 *.swp
 *.swo
 .DS_Store
@@ -37,3 +52,21 @@ logs/
 *.log
 ffmpeg.exe
 ffprobe.exe
+=======
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Downloaded music
+songs/
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+>>>>>>> ec914116a50255c5a4639af876094c8e846ce15b
